@@ -1,126 +1,96 @@
-
-import { IncomingForm } from 'formidable';
-import fs from 'fs';
 import { getToken } from "next-auth/jwt";
 import { baseURL } from "@/lib/config";
 
-
-export const config = {
-  api: {
-    bodyParser: false, // Disable default body parsing
-  },
-};
+const ALLOWED_METHODS = ["GET", "POST", "PUT", "DELETE"];
+const REQUEST_TIMEOUT = 30000; // 30 seconds
 
 export default async function handler(req, res) {
-  const { method, query } = req;
-  const apiPath = Array.isArray(query.slug) ? query.slug.join("/") : "";
+  const { method, body, query } = req;
 
-  const allowedMethods = ["POST", "PUT", "PATCH"];
-
-  
-  if (!allowedMethods.includes(method)) {
+  if (!ALLOWED_METHODS.includes(method)) {
     return res.status(405).json({
-      success: false,
-      message: `Method ${method} not allowed for FormData requests`,
+      error: `Method ${method} not allowed`,
     });
   }
 
   try {
     // Verify authentication
-  const session = await getToken({req, secret: process.env.NEXTAUTH_SECRET});
+    const session = await getToken({
+      req,
+      secret: process.env.NEXTAUTH_SECRET,
+    });
+
     if (!session?.access_token) {
       return res.status(401).json({
-        success: false,
-        message: "Unauthorized - No access token",
+        error: "Unauthorized",
       });
     }
 
-    // Parse FormData using formidable
-    const formData = await parseFormData(req);
-
-    // Construct request to backend API
-    const apiUrl =`${baseURL}/api/${apiPath}/`;
-
-
-    // Create new FormData for the outgoing request
-    const outgoingForm = new FormData();
-
-    // Append all fields
-    for (const [key, value] of Object.entries(formData.fields)) {
-      // Handle array fields (if value is an array)
-      if (Array.isArray(value)) {
-        value.forEach(v => outgoingForm.append(key, v));
-      } else {
-        outgoingForm.append(key, value);
-      }
+    // Validate API path
+    const slug = query.slug ?? [];
+    delete query.slug;
+    const apiPath = Array.isArray(slug) ? slug.join("/") : null;
+    if (!apiPath) {
+      return res.status(400).json({
+        error: "Invalid API path",
+      });
     }
 
-    // Append all files
-    for (const [key, files] of Object.entries(formData.files)) {
-      const fileArray = Array.isArray(files) ? files : [files];
-      for (const file of fileArray) {
-        // Read the file content and create a Blob
-        const fileContent = fs.readFileSync(file.filepath);
-        const blob = new Blob([fileContent], { type: file.mimetype || 'application/octet-stream' });
-        
-        // Append the Blob with the original filename
-        outgoingForm.append(key, blob, file.originalFilename || file.newFilename);
-      }
-    }
+    // Build query string
+    const { page = 1, limit = 25, search = "", ...filters } = query;
+    const queryParams = new URLSearchParams({
+      page,
+      page_size: limit,
+      ...(search && { search }),
+      ...filters,
+    });
 
-    // Prepare headers
+    const apiUrl = `${baseURL}/api/${apiPath}/?${queryParams.toString()}`;
+
+    // Configure fetch options
     const headers = {
+      "Content-Type": "application/json",
       Authorization: `Bearer ${session.access_token}`,
-      // Don't set Content-Type - let the browser set it with the boundary
     };
 
-    // Prepare request options
-    const requestOptions = {
-      method: method,
-      headers: headers,
-      body: outgoingForm,
+    const fetchOptions = {
+      method,
+      headers,
+      ...(method !== "GET" && { body: JSON.stringify(body) }),
     };
 
-    const apiResponse = await fetch(apiUrl, requestOptions);
-    const responseContentType = apiResponse.headers.get("content-type");
+    // Add timeout support
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+    fetchOptions.signal = controller.signal;
 
-    if (!apiResponse.ok) {
-      const errorData = responseContentType?.includes("application/json")
-        ? await apiResponse.json()
-        : await apiResponse.text();
+    // Make API request
+    const response = await fetch(apiUrl, fetchOptions);
+    clearTimeout(timeout);
 
-      return res.status(apiResponse.status).json({
-        success: false,
-        message: errorData.message || "API request failed",
-        error: errorData,
+    // Handle response
+    const contentType = response.headers.get("content-type");
+    const isJson = contentType?.includes("application/json");
+    const data = isJson ? await response.json() : await response.text();
+
+    if (!response.ok) {
+      return res.status(response.status).json({
+        error: data,
       });
     }
 
-    const responseData = responseContentType?.includes("application/json")
-      ? await apiResponse.json()
-      : await apiResponse.text();
-      
-    return res.status(apiResponse.status).json({
-      success: true,
-      data: responseData,
+    return res.status(response.status).json({
+      ...data,
     });
   } catch (error) {
-   
+    if (error.name === "AbortError") {
+      return res.status(504).json({
+        error: "Request timeout",
+      });
+    }
+
     return res.status(500).json({
-      success: false,
-      message: "Internal proxy server error",
-      error: error.message,
+      error: "Internal server error",
     });
   }
-}
-
-// Helper function to parse FormData using formidable
-async function parseFormData(req) {
-  return new Promise((resolve, reject) => {
-    const form = new IncomingForm();
-    form.parse(req, (err, fields, files) => {
-      if (err) return reject(err);
-      resolve({ fields, files });
-    });
-  });
 }
